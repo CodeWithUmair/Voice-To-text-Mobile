@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls \"e:\\\\Applications\")",
+      "Read(//e/Applications/**)",
+      "PowerShell(npm install 2>&1)",
+      "PowerShell(npx expo install --check 2>&1)",
+      "PowerShell(npx expo install --fix 2>&1)",
+      "PowerShell($ErrorActionPreference='SilentlyContinue'; $v = & eas --version 2>$null; if \\($v\\) { Write-Output \"EAS CLI installed: $v\" } else { Write-Output 'EAS CLI not installed globally' })",
+      "PowerShell(npm install -g eas-cli 2>&1)",
+      "PowerShell(eas --version)"
+    ]
+  }
+}

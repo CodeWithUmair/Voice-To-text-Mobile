@@ -1,0 +1,25 @@
+{
+  "expo": {
+    "name": "Voice to Text",
+    "slug": "voice-to-text-mobile",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "android": {
+      "package": "com.umair.voicetotext",
+      "versionCode": 1,
+      "permissions": [
+        "android.permission.RECORD_AUDIO"
+      ]
+    },
+    "plugins": [
+      [
+        "expo-av",
+        {
+          "microphonePermission": "Voice to Text needs the microphone to record your voice for transcription."
+        }
+      ]
+    ]
+  }
+}
