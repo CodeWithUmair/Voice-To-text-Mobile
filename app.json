@@ -10,7 +10,8 @@
       "package": "com.umair.voicetotext",
       "versionCode": 1,
       "permissions": [
-        "android.permission.RECORD_AUDIO"
+        "android.permission.RECORD_AUDIO",
+        "android.permission.MODIFY_AUDIO_SETTINGS"
       ]
     },
     "plugins": [
@@ -20,6 +21,11 @@
           "microphonePermission": "Voice to Text needs the microphone to record your voice for transcription."
         }
       ]
-    ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "cb0ea22c-6aa0-4cd0-a77e-087ac9b24555"
+      }
+    }
   }
 }
