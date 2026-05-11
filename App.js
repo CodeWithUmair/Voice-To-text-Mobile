@@ -9,8 +9,8 @@ import {
   Alert,
   KeyboardAvoidingView,
   Platform,
-  SafeAreaView,
 } from 'react-native';
+import { SafeAreaView, SafeAreaProvider } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
 import { Audio } from 'expo-av';
 import * as Clipboard from 'expo-clipboard';
@@ -41,6 +41,14 @@ const API_KEY_STORE_KEY = 'openai_api_key';
 const OPENAI_MODEL = 'gpt-4o-mini-transcribe';
 
 export default function App() {
+  return (
+    <SafeAreaProvider>
+      <VoiceToText />
+    </SafeAreaProvider>
+  );
+}
+
+function VoiceToText() {
   const [text, setText] = useState('');
   const [isRecording, setIsRecording] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
@@ -273,6 +281,8 @@ export default function App() {
           scrollEnabled
         />
 
+        <View style={styles.spacer} />
+
         <View style={styles.langRow}>
           {LANGS.map((l) => (
             <TouchableOpacity
@@ -414,7 +424,8 @@ const styles = StyleSheet.create({
   gearText: { color: COLORS.muted, fontSize: 18 },
   content: { flex: 1, padding: 16, gap: 12 },
   output: {
-    flex: 1,
+    minHeight: 200,
+    maxHeight: 400,
     backgroundColor: COLORS.surface,
     borderColor: COLORS.border,
     borderWidth: 1,
@@ -424,6 +435,7 @@ const styles = StyleSheet.create({
     fontSize: 16,
     lineHeight: 24,
   },
+  spacer: { flex: 1 },
   langRow: { flexDirection: 'row', gap: 6, flexWrap: 'wrap' },
   langChip: {
     paddingHorizontal: 12,
