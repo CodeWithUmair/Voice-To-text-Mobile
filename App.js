@@ -12,9 +12,11 @@ import {
 } from 'react-native';
 import { SafeAreaView, SafeAreaProvider } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
-import { Audio } from 'expo-av';
 import * as Clipboard from 'expo-clipboard';
-import * as SecureStore from 'expo-secure-store';
+import {
+  ExpoSpeechRecognitionModule,
+  useSpeechRecognitionEvent,
+} from 'expo-speech-recognition';
 
 const COLORS = {
   bg: '#0f0f11',
@@ -22,23 +24,19 @@ const COLORS = {
   border: '#2a2a32',
   accent: '#7c6af7',
   recording: '#ef4444',
-  transcribing: '#f59e0b',
+  partial: '#9a93f0',
   text: '#e8e8f0',
   muted: '#6b6b7a',
   success: '#22c55e',
+  warn: '#f59e0b',
 };
 
 const LANGS = [
-  { label: 'Auto', value: '' },
-  { label: 'EN', value: 'en' },
-  { label: 'UR', value: 'ur' },
-  { label: 'HI', value: 'hi' },
-  { label: 'AR', value: 'ar' },
+  { label: 'EN', value: 'en-US' },
+  { label: 'UR', value: 'ur-PK' },
+  { label: 'HI', value: 'hi-IN' },
+  { label: 'AR', value: 'ar-SA' },
 ];
-
-const MAX_RECORDING_MS = 120000;
-const API_KEY_STORE_KEY = 'openai_api_key';
-const OPENAI_MODEL = 'gpt-4o-mini-transcribe';
 
 export default function App() {
   return (
@@ -49,49 +47,95 @@ export default function App() {
 }
 
 function VoiceToText() {
-  const [text, setText] = useState('');
+  const [accepted, setAccepted] = useState('');
+  const [partial, setPartial] = useState('');
   const [isRecording, setIsRecording] = useState(false);
-  const [isTranscribing, setIsTranscribing] = useState(false);
   const [status, setStatus] = useState('Ready — tap mic to start');
-  const [apiKey, setApiKey] = useState('');
-  const [showSettings, setShowSettings] = useState(false);
-  const [tempKey, setTempKey] = useState('');
-  const [language, setLanguage] = useState('en');
+  const [language, setLanguage] = useState('en-US');
+  const [showInfo, setShowInfo] = useState(false);
   const [toastVisible, setToastVisible] = useState(false);
+  const [onDevice, setOnDevice] = useState(true);
+  const [supportsOnDevice, setSupportsOnDevice] = useState(true);
+  const [installedLocales, setInstalledLocales] = useState([]);
 
-  const recordingRef = useRef(null);
-  const maxTimerRef = useRef(null);
-  const apiKeyRef = useRef('');
-  const languageRef = useRef('en');
+  const languageRef = useRef('en-US');
+  const onDeviceRef = useRef(true);
+  const acceptedRef = useRef('');
 
-  useEffect(() => { apiKeyRef.current = apiKey; }, [apiKey]);
   useEffect(() => { languageRef.current = language; }, [language]);
+  useEffect(() => { onDeviceRef.current = onDevice; }, [onDevice]);
+  useEffect(() => { acceptedRef.current = accepted; }, [accepted]);
 
   useEffect(() => {
+    try {
+      const ok = ExpoSpeechRecognitionModule.supportsOnDeviceRecognition?.() ?? false;
+      setSupportsOnDevice(ok);
+      if (!ok) setOnDevice(false);
+    } catch {
+      setSupportsOnDevice(false);
+      setOnDevice(false);
+    }
     (async () => {
       try {
-        const k = await SecureStore.getItemAsync(API_KEY_STORE_KEY);
-        if (k) {
-          setApiKey(k);
-        } else {
-          setStatus('Set OpenAI key (gear icon) to start');
-        }
-      } catch {
-        setStatus('Set OpenAI key (gear icon) to start');
-      }
+        const res = await ExpoSpeechRecognitionModule.getSupportedLocales({
+          androidRecognitionServicePackage: 'com.google.android.as',
+        });
+        setInstalledLocales(res?.installedLocales || []);
+      } catch {}
     })();
-    return () => {
-      if (maxTimerRef.current) clearTimeout(maxTimerRef.current);
-    };
   }, []);
 
-  async function startRecording() {
-    if (!apiKeyRef.current) {
-      openSettings();
-      return;
+  useSpeechRecognitionEvent('start', () => {
+    setIsRecording(true);
+    setStatus('Listening… tap stop when done');
+  });
+
+  useSpeechRecognitionEvent('end', () => {
+    setIsRecording(false);
+    setPartial((p) => {
+      if (p) commitChunk(p);
+      return '';
+    });
+    setStatus((s) => (s.startsWith('❌') ? s : 'Done — edit if needed, or tap mic to add more'));
+  });
+
+  useSpeechRecognitionEvent('result', (event) => {
+    const transcript = event.results?.[0]?.transcript ?? '';
+    if (!transcript) return;
+    if (event.isFinal) {
+      commitChunk(transcript);
+      setPartial('');
+    } else {
+      setPartial(transcript);
     }
+  });
+
+  useSpeechRecognitionEvent('error', (event) => {
+    setIsRecording(false);
+    setPartial('');
+    const msg = errorMessage(event);
+    setStatus('❌ ' + msg);
+  });
+
+  useSpeechRecognitionEvent('nomatch', () => {
+    setStatus('No speech detected — try again');
+  });
+
+  function commitChunk(chunk) {
+    const piece = chunk.trim();
+    if (!piece) return;
+    setAccepted((cur) => {
+      const merged = cur.trim() ? cur.trim() + ' ' + piece : piece;
+      acceptedRef.current = merged;
+      Clipboard.setStringAsync(merged).catch(() => {});
+      return merged;
+    });
+    showToast();
+  }
+
+  async function start() {
     try {
-      const perm = await Audio.requestPermissionsAsync();
+      const perm = await ExpoSpeechRecognitionModule.requestPermissionsAsync();
       if (!perm.granted) {
         Alert.alert(
           'Microphone blocked',
@@ -99,156 +143,75 @@ function VoiceToText() {
         );
         return;
       }
-      await Audio.setAudioModeAsync({
-        allowsRecordingIOS: true,
-        playsInSilentModeIOS: true,
+
+      setPartial('');
+      setStatus('Starting…');
+
+      ExpoSpeechRecognitionModule.start({
+        lang: languageRef.current,
+        interimResults: true,
+        continuous: true,
+        maxAlternatives: 1,
+        requiresOnDeviceRecognition: onDeviceRef.current && supportsOnDevice,
+        addsPunctuation: true,
+        androidRecognitionServicePackage: 'com.google.android.as',
+        androidIntentOptions: {
+          EXTRA_PREFER_OFFLINE: onDeviceRef.current && supportsOnDevice,
+        },
       });
-
-      const { recording } = await Audio.Recording.createAsync(
-        Audio.RecordingOptionsPresets.HIGH_QUALITY
-      );
-      recordingRef.current = recording;
-      setIsRecording(true);
-      setStatus('Listening… tap stop when done');
-
-      maxTimerRef.current = setTimeout(() => {
-        stopRecording(`Auto-stopped (max ${MAX_RECORDING_MS / 1000}s)`);
-      }, MAX_RECORDING_MS);
     } catch (e) {
-      setStatus('Mic error: ' + (e?.message || String(e)));
       setIsRecording(false);
-      recordingRef.current = null;
-    }
-  }
-
-  async function stopRecording(autoStatusMsg) {
-    const rec = recordingRef.current;
-    if (!rec) return;
-    recordingRef.current = null;
-    setIsRecording(false);
-    if (maxTimerRef.current) {
-      clearTimeout(maxTimerRef.current);
-      maxTimerRef.current = null;
-    }
-
-    let uri = null;
-    try {
-      await rec.stopAndUnloadAsync();
-      uri = rec.getURI();
-    } catch (e) {
-      setStatus('Stop error: ' + (e?.message || String(e)));
-      return;
-    }
-    Audio.setAudioModeAsync({ allowsRecordingIOS: false }).catch(() => {});
-
-    if (!uri) {
-      setStatus('No audio captured — try again');
-      return;
-    }
-
-    setIsTranscribing(true);
-    setStatus(autoStatusMsg || 'Transcribing…');
-    try {
-      const newText = await transcribe(uri);
-      if (newText) {
-        setText((cur) => {
-          const merged = cur.trim() ? cur.trim() + ' ' + newText : newText;
-          Clipboard.setStringAsync(merged).catch(() => {});
-          return merged;
-        });
-        setStatus('Done — edit if needed, or tap mic to add more');
-        showToast();
-      } else {
-        setStatus('No speech detected — try again');
-      }
-    } catch (e) {
       setStatus('❌ ' + (e?.message || String(e)));
-    } finally {
-      setIsTranscribing(false);
     }
   }
 
-  async function transcribe(uri) {
-    const form = new FormData();
-    form.append('file', {
-      uri,
-      name: 'audio.m4a',
-      type: 'audio/m4a',
-    });
-    form.append('model', OPENAI_MODEL);
-    if (languageRef.current) form.append('language', languageRef.current);
-    form.append('response_format', 'json');
-
-    const res = await fetch('https://api.openai.com/v1/audio/transcriptions', {
-      method: 'POST',
-      headers: { Authorization: 'Bearer ' + apiKeyRef.current },
-      body: form,
-    });
-
-    if (!res.ok) {
-      let detail = '';
-      try {
-        const j = await res.json();
-        detail = j?.error?.message || '';
-      } catch {}
-      throw new Error('API ' + res.status + (detail ? ': ' + detail : ''));
-    }
-    const data = await res.json();
-    return (data.text || '').trim();
+  function stop() {
+    try {
+      ExpoSpeechRecognitionModule.stop();
+    } catch {}
   }
 
-  async function toggleRecord() {
-    if (isTranscribing) return;
-    if (isRecording) await stopRecording();
-    else await startRecording();
+  function toggleRecord() {
+    if (isRecording) stop();
+    else start();
   }
 
   async function copyText() {
-    const t = text.trim();
+    const t = displayText().trim();
     if (!t) return;
     await Clipboard.setStringAsync(t);
     showToast();
   }
 
   function clearAll() {
-    setText('');
-    setStatus(apiKeyRef.current ? 'Cleared — tap mic to start' : 'Set OpenAI key (gear icon) to start');
-  }
-
-  async function saveSettings() {
-    const k = tempKey.trim();
-    if (k && !k.startsWith('sk-')) {
-      Alert.alert('Invalid key', 'OpenAI keys should start with "sk-"');
-      return;
-    }
-    try {
-      await SecureStore.setItemAsync(API_KEY_STORE_KEY, k);
-    } catch (e) {
-      Alert.alert('Save failed', e?.message || String(e));
-      return;
-    }
-    setApiKey(k);
-    setShowSettings(false);
-    setStatus(k ? 'Ready — tap mic to start' : 'Set OpenAI key (gear icon) to start');
+    if (isRecording) return;
+    setAccepted('');
+    setPartial('');
+    acceptedRef.current = '';
+    setStatus('Cleared — tap mic to start');
   }
 
   function showToast() {
     setToastVisible(true);
-    setTimeout(() => setToastVisible(false), 1800);
+    setTimeout(() => setToastVisible(false), 1500);
   }
 
-  function openSettings() {
-    setTempKey(apiKey);
-    setShowSettings(true);
+  function displayText() {
+    if (!partial) return accepted;
+    return accepted.trim() ? accepted.trim() + ' ' + partial : partial;
   }
 
-  const hasText = text.trim().length > 0;
-  const micColor = isRecording
-    ? COLORS.recording
-    : isTranscribing
-    ? COLORS.transcribing
-    : COLORS.accent;
-  const micLabel = isRecording ? 'Stop' : isTranscribing ? '…' : 'Record';
+  function handleEdit(next) {
+    if (isRecording) return;
+    setAccepted(next);
+    acceptedRef.current = next;
+  }
+
+  const hasText = displayText().trim().length > 0;
+  const micColor = isRecording ? COLORS.recording : COLORS.accent;
+  const micLabel = isRecording ? 'Stop' : 'Record';
+  const localeInstalled = installedLocales.includes(language);
+  const offlineActive = onDevice && supportsOnDevice;
 
   return (
     <SafeAreaView style={styles.root}>
@@ -259,8 +222,11 @@ function VoiceToText() {
             <Text style={styles.appIconText}>🎙</Text>
           </View>
           <Text style={styles.title}>Voice to Text</Text>
+          <View style={[styles.badge, offlineActive ? styles.badgeOk : styles.badgeWarn]}>
+            <Text style={styles.badgeText}>{offlineActive ? 'Offline' : 'Online'}</Text>
+          </View>
         </View>
-        <TouchableOpacity onPress={openSettings} style={styles.gearBtn}>
+        <TouchableOpacity onPress={() => setShowInfo(true)} style={styles.gearBtn}>
           <Text style={styles.gearText}>⚙</Text>
         </TouchableOpacity>
       </View>
@@ -269,38 +235,55 @@ function VoiceToText() {
         style={styles.content}
         behavior={Platform.OS === 'ios' ? 'padding' : undefined}
       >
-        <TextInput
-          style={styles.output}
-          value={text}
-          onChangeText={setText}
-          placeholder="Tap the mic to start speaking…"
-          placeholderTextColor={COLORS.muted}
-          multiline
-          textAlignVertical="top"
-          editable={!isTranscribing}
-          scrollEnabled
-        />
+        <View style={styles.outputWrap}>
+          <TextInput
+            style={styles.output}
+            value={displayText()}
+            onChangeText={handleEdit}
+            placeholder="Tap the mic and start speaking — words appear as you talk."
+            placeholderTextColor={COLORS.muted}
+            multiline
+            textAlignVertical="top"
+            editable={!isRecording}
+            scrollEnabled
+          />
+          {isRecording && partial ? (
+            <View style={styles.partialPill}>
+              <View style={styles.pulseDot} />
+              <Text style={styles.partialPillText} numberOfLines={1}>
+                {partial}
+              </Text>
+            </View>
+          ) : null}
+        </View>
 
         <View style={styles.spacer} />
 
         <View style={styles.langRow}>
-          {LANGS.map((l) => (
-            <TouchableOpacity
-              key={l.value || 'auto'}
-              onPress={() => setLanguage(l.value)}
-              style={[styles.langChip, language === l.value && styles.langChipActive]}
-            >
-              <Text
-                style={[
-                  styles.langChipText,
-                  language === l.value && styles.langChipTextActive,
-                ]}
+          {LANGS.map((l) => {
+            const active = language === l.value;
+            const installed = installedLocales.includes(l.value);
+            return (
+              <TouchableOpacity
+                key={l.value}
+                onPress={() => !isRecording && setLanguage(l.value)}
+                style={[styles.langChip, active && styles.langChipActive]}
+                disabled={isRecording}
               >
-                {l.label}
-              </Text>
-            </TouchableOpacity>
-          ))}
+                <Text style={[styles.langChipText, active && styles.langChipTextActive]}>
+                  {l.label}
+                  {offlineActive && !installed ? ' ·' : ''}
+                </Text>
+              </TouchableOpacity>
+            );
+          })}
         </View>
+
+        {offlineActive && !localeInstalled ? (
+          <Text style={styles.warnText}>
+            "{language}" offline pack not installed — recognition may fall back to network or fail. Open ⚙ for help.
+          </Text>
+        ) : null}
 
         <Text style={styles.statusText} numberOfLines={2}>
           {status}
@@ -308,9 +291,9 @@ function VoiceToText() {
 
         <View style={styles.controls}>
           <TouchableOpacity
-            style={[styles.actionBtn, !hasText && styles.actionBtnDisabled]}
+            style={[styles.actionBtn, (!hasText || isRecording) && styles.actionBtnDisabled]}
             onPress={clearAll}
-            disabled={!hasText}
+            disabled={!hasText || isRecording}
           >
             <Text style={styles.actionBtnText}>Clear</Text>
           </TouchableOpacity>
@@ -318,7 +301,6 @@ function VoiceToText() {
           <TouchableOpacity
             style={[styles.micBtn, { backgroundColor: micColor }]}
             onPress={toggleRecord}
-            disabled={isTranscribing}
             activeOpacity={0.8}
           >
             <Text style={styles.micLabel}>{micLabel}</Text>
@@ -345,41 +327,61 @@ function VoiceToText() {
       )}
 
       <Modal
-        visible={showSettings}
+        visible={showInfo}
         animationType="fade"
         transparent
-        onRequestClose={() => setShowSettings(false)}
+        onRequestClose={() => setShowInfo(false)}
       >
         <View style={styles.modalBackdrop}>
           <View style={styles.modal}>
-            <Text style={styles.modalTitle}>OpenAI API Key</Text>
-            <TextInput
-              style={styles.modalInput}
-              value={tempKey}
-              onChangeText={setTempKey}
-              placeholder="sk-..."
-              placeholderTextColor={COLORS.muted}
-              autoCapitalize="none"
-              autoCorrect={false}
-              secureTextEntry
-            />
+            <Text style={styles.modalTitle}>Recognition Mode</Text>
+
+            <TouchableOpacity
+              style={styles.toggleRow}
+              onPress={() => supportsOnDevice && setOnDevice((v) => !v)}
+              disabled={!supportsOnDevice}
+            >
+              <View style={styles.toggleLabelWrap}>
+                <Text style={styles.toggleLabel}>On-device only</Text>
+                <Text style={styles.toggleHint}>
+                  {supportsOnDevice
+                    ? 'Runs fully offline using Google\'s on-device speech model. No data leaves the phone.'
+                    : 'Not supported on this device — using Google\'s online recognizer.'}
+                </Text>
+              </View>
+              <View style={[styles.switch, onDevice && styles.switchOn]}>
+                <View style={[styles.switchKnob, onDevice && styles.switchKnobOn]} />
+              </View>
+            </TouchableOpacity>
+
+            <View style={styles.divider} />
+
+            <Text style={styles.modalTitle}>Offline Language Packs</Text>
             <Text style={styles.modalHint}>
-              Get a key at platform.openai.com → API keys. Stored encrypted on this device.
+              For offline recognition, install language packs on your phone:{'\n'}
+              Settings → Languages & input → Speech Recognition & Synthesis from Google → Offline speech recognition.
             </Text>
+
+            <View style={styles.localeList}>
+              {LANGS.map((l) => {
+                const installed = installedLocales.includes(l.value);
+                return (
+                  <View key={l.value} style={styles.localeRow}>
+                    <Text style={styles.localeName}>{l.value}</Text>
+                    <Text style={[styles.localeStatus, installed ? styles.localeOk : styles.localeMissing]}>
+                      {installed ? '✓ installed' : '— not installed'}
+                    </Text>
+                  </View>
+                );
+              })}
+            </View>
+
             <View style={styles.modalActions}>
               <TouchableOpacity
-                style={styles.actionBtn}
-                onPress={() => setShowSettings(false)}
-              >
-                <Text style={styles.actionBtnText}>Cancel</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
                 style={[styles.actionBtn, styles.actionBtnPrimary]}
-                onPress={saveSettings}
+                onPress={() => setShowInfo(false)}
               >
-                <Text style={[styles.actionBtnText, styles.actionBtnTextPrimary]}>
-                  Save
-                </Text>
+                <Text style={[styles.actionBtnText, styles.actionBtnTextPrimary]}>Close</Text>
               </TouchableOpacity>
             </View>
           </View>
@@ -387,6 +389,29 @@ function VoiceToText() {
       </Modal>
     </SafeAreaView>
   );
+}
+
+function errorMessage(event) {
+  switch (event?.error) {
+    case 'not-allowed':
+      return 'Mic or speech permission denied';
+    case 'no-speech':
+      return 'No speech detected';
+    case 'speech-timeout':
+      return 'Stopped — no speech for a while';
+    case 'language-not-supported':
+      return 'Language not supported on this device';
+    case 'service-not-allowed':
+      return 'Speech service unavailable. Install Google offline speech model.';
+    case 'network':
+      return 'Network required for this language. Enable on-device or install offline pack.';
+    case 'busy':
+      return 'Recognizer busy — try again';
+    case 'audio-capture':
+      return 'Mic error — close other recording apps';
+    default:
+      return event?.message || event?.error || 'Unknown error';
+  }
 }
 
 const styles = StyleSheet.create({
@@ -411,6 +436,15 @@ const styles = StyleSheet.create({
   },
   appIconText: { fontSize: 14 },
   title: { color: COLORS.text, fontSize: 16, fontWeight: '600' },
+  badge: {
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 999,
+    borderWidth: 1,
+  },
+  badgeOk: { borderColor: COLORS.success, backgroundColor: 'rgba(34,197,94,0.12)' },
+  badgeWarn: { borderColor: COLORS.warn, backgroundColor: 'rgba(245,158,11,0.12)' },
+  badgeText: { color: COLORS.text, fontSize: 10, fontWeight: '600' },
   gearBtn: {
     width: 36,
     height: 36,
@@ -423,6 +457,7 @@ const styles = StyleSheet.create({
   },
   gearText: { color: COLORS.muted, fontSize: 18 },
   content: { flex: 1, padding: 16, gap: 12 },
+  outputWrap: { position: 'relative' },
   output: {
     minHeight: 200,
     maxHeight: 400,
@@ -435,6 +470,28 @@ const styles = StyleSheet.create({
     fontSize: 16,
     lineHeight: 24,
   },
+  partialPill: {
+    position: 'absolute',
+    left: 10,
+    bottom: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 999,
+    backgroundColor: 'rgba(124,106,247,0.18)',
+    borderWidth: 1,
+    borderColor: COLORS.partial,
+    maxWidth: '90%',
+  },
+  pulseDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: COLORS.recording,
+  },
+  partialPillText: { color: COLORS.partial, fontSize: 11, fontStyle: 'italic' },
   spacer: { flex: 1 },
   langRow: { flexDirection: 'row', gap: 6, flexWrap: 'wrap' },
   langChip: {
@@ -449,6 +506,7 @@ const styles = StyleSheet.create({
   langChipText: { color: COLORS.muted, fontSize: 12, fontWeight: '500' },
   langChipTextActive: { color: 'white' },
   statusText: { color: COLORS.muted, fontSize: 13, paddingHorizontal: 2 },
+  warnText: { color: COLORS.warn, fontSize: 11, paddingHorizontal: 2 },
   controls: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -506,18 +564,43 @@ const styles = StyleSheet.create({
     padding: 18,
     gap: 12,
   },
-  modalTitle: { color: COLORS.text, fontSize: 16, fontWeight: '600' },
-  modalInput: {
-    backgroundColor: COLORS.bg,
-    borderColor: COLORS.border,
-    borderWidth: 1,
-    borderRadius: 8,
-    padding: 12,
-    color: COLORS.text,
-    fontSize: 14,
-    fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace' }),
-  },
+  modalTitle: { color: COLORS.text, fontSize: 15, fontWeight: '600' },
   modalHint: { color: COLORS.muted, fontSize: 12, lineHeight: 18 },
+  toggleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  toggleLabelWrap: { flex: 1, gap: 4 },
+  toggleLabel: { color: COLORS.text, fontSize: 14, fontWeight: '500' },
+  toggleHint: { color: COLORS.muted, fontSize: 11, lineHeight: 16 },
+  switch: {
+    width: 44,
+    height: 26,
+    borderRadius: 999,
+    backgroundColor: COLORS.border,
+    padding: 3,
+    justifyContent: 'center',
+  },
+  switchOn: { backgroundColor: COLORS.accent },
+  switchKnob: {
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    backgroundColor: COLORS.text,
+  },
+  switchKnobOn: { alignSelf: 'flex-end' },
+  divider: { height: 1, backgroundColor: COLORS.border, marginVertical: 4 },
+  localeList: { gap: 6 },
+  localeRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    paddingVertical: 4,
+  },
+  localeName: { color: COLORS.text, fontSize: 13, fontFamily: Platform.select({ android: 'monospace' }) },
+  localeStatus: { fontSize: 12 },
+  localeOk: { color: COLORS.success },
+  localeMissing: { color: COLORS.muted },
   modalActions: {
     flexDirection: 'row',
     gap: 8,

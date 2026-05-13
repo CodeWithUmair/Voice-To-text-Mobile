@@ -10,7 +10,13 @@
       "PowerShell(npm install -g eas-cli 2>&1)",
       "PowerShell(eas --version)",
       "PowerShell(npx expo export --platform android --output-dir .tmp-bundle-check 2>&1)",
-      "PowerShell(npx expo install babel-preset-expo --dev 2>&1)"
+      "PowerShell(npx expo install babel-preset-expo --dev 2>&1)",
+      "Bash(npm install *)",
+      "Bash(npm uninstall *)",
+      "Bash(node -e \"require\\('@babel/core'\\).transformFileSync\\('App.js', { presets: ['babel-preset-expo'] }\\); console.log\\('App.js: parsed OK'\\);\")",
+      "Bash(node -e \"JSON.parse\\(require\\('fs'\\).readFileSync\\('app.json','utf8'\\)\\); JSON.parse\\(require\\('fs'\\).readFileSync\\('package.json','utf8'\\)\\); console.log\\('JSON: OK'\\)\")",
+      "Bash(npx expo *)",
+      "Bash(node -e \"JSON.parse\\(require\\('fs'\\).readFileSync\\('eas.json','utf8'\\)\\); JSON.parse\\(require\\('fs'\\).readFileSync\\('package.json','utf8'\\)\\); console.log\\('Config: OK'\\)\")"
     ]
   }
 }
