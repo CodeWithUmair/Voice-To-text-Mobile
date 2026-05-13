@@ -24,7 +24,6 @@ const COLORS = {
   border: '#2a2a32',
   accent: '#7c6af7',
   recording: '#ef4444',
-  partial: '#9a93f0',
   text: '#e8e8f0',
   muted: '#6b6b7a',
   success: '#22c55e',
@@ -57,10 +56,15 @@ function VoiceToText() {
   const [onDevice, setOnDevice] = useState(true);
   const [supportsOnDevice, setSupportsOnDevice] = useState(true);
   const [installedLocales, setInstalledLocales] = useState([]);
+  const [installingLocale, setInstallingLocale] = useState(null);
 
   const languageRef = useRef('en-US');
   const onDeviceRef = useRef(true);
   const acceptedRef = useRef('');
+  const keepListeningRef = useRef(false);
+  const userStoppedRef = useRef(false);
+  const lastFinalRef = useRef('');
+  const restartCountRef = useRef(0);
 
   useEffect(() => { languageRef.current = language; }, [language]);
   useEffect(() => { onDeviceRef.current = onDevice; }, [onDevice]);
@@ -75,28 +79,110 @@ function VoiceToText() {
       setSupportsOnDevice(false);
       setOnDevice(false);
     }
-    (async () => {
-      try {
-        const res = await ExpoSpeechRecognitionModule.getSupportedLocales({
-          androidRecognitionServicePackage: 'com.google.android.as',
-        });
-        setInstalledLocales(res?.installedLocales || []);
-      } catch {}
-    })();
+    refreshInstalledLocales();
   }, []);
+
+  async function refreshInstalledLocales() {
+    try {
+      const res = await ExpoSpeechRecognitionModule.getSupportedLocales({
+        androidRecognitionServicePackage: 'com.google.android.as',
+      });
+      setInstalledLocales(res?.installedLocales || []);
+    } catch {}
+  }
+
+  async function installLocale(locale) {
+    if (installingLocale) return;
+    setInstallingLocale(locale);
+    try {
+      const res = await ExpoSpeechRecognitionModule.androidTriggerOfflineModelDownload({ locale });
+      if (res?.status === 'download_success') {
+        await refreshInstalledLocales();
+      } else if (res?.status === 'opened_dialog') {
+        Alert.alert(
+          'Download started',
+          'Android opened the language download dialog. Confirm it, then reopen this panel to refresh.'
+        );
+      } else if (res?.status === 'download_canceled') {
+        Alert.alert('Canceled', 'Download was canceled.');
+      }
+    } catch (e) {
+      handleInstallError(e, locale);
+    } finally {
+      setInstallingLocale(null);
+    }
+  }
+
+  function handleInstallError(e, locale) {
+    const msg = e?.message || String(e);
+    const codeMatch = msg.match(/error:\s*(\d+)/i);
+    const code = codeMatch ? parseInt(codeMatch[1], 10) : null;
+
+    if (code === 12) {
+      Alert.alert(
+        'Offline not available',
+        `Google doesn't offer an offline speech pack for "${locale}" on this device.\n\nYou can still use this language by switching to online mode (no API key, still free).`,
+        [
+          { text: 'Keep offline', style: 'cancel' },
+          {
+            text: 'Switch to online',
+            onPress: () => {
+              setOnDevice(false);
+              setLanguage(locale);
+              setShowInfo(false);
+            },
+          },
+        ]
+      );
+      return;
+    }
+
+    if (code === 13) {
+      Alert.alert(
+        'Pack unavailable',
+        `"${locale}" pack is currently unavailable on Google's servers. Try again later or check your device storage.`
+      );
+      return;
+    }
+
+    if (code === 9) {
+      Alert.alert(
+        'Permission needed',
+        'Speech recognition permission was denied. Enable it in Android Settings → Apps → Voice to Text → Permissions.'
+      );
+      return;
+    }
+
+    Alert.alert(
+      'Install failed',
+      msg +
+        '\n\nFallback: Settings → System → Languages → Speech Recognition & Synthesis from Google → Offline speech recognition.'
+    );
+  }
 
   useSpeechRecognitionEvent('start', () => {
     setIsRecording(true);
+    restartCountRef.current = 0;
     setStatus('Listening… tap stop when done');
   });
 
   useSpeechRecognitionEvent('end', () => {
+    if (keepListeningRef.current && !userStoppedRef.current) {
+      restartRecognizer();
+      return;
+    }
     setIsRecording(false);
     setPartial((p) => {
       if (p) commitChunk(p);
       return '';
     });
-    setStatus((s) => (s.startsWith('❌') ? s : 'Done — edit if needed, or tap mic to add more'));
+    if (userStoppedRef.current && acceptedRef.current.trim()) {
+      Clipboard.setStringAsync(acceptedRef.current.trim()).catch(() => {});
+      showToast();
+    }
+    userStoppedRef.current = false;
+    keepListeningRef.current = false;
+    setStatus((s) => (s.startsWith('❌') ? s : 'Done — tap mic to add more, or Copy'));
   });
 
   useSpeechRecognitionEvent('result', (event) => {
@@ -104,20 +190,38 @@ function VoiceToText() {
     if (!transcript) return;
     if (event.isFinal) {
       commitChunk(transcript);
+      lastFinalRef.current = transcript.trim();
       setPartial('');
     } else {
+      const t = transcript.trim();
+      if (t && t === lastFinalRef.current) {
+        setPartial('');
+        return;
+      }
       setPartial(transcript);
     }
   });
 
   useSpeechRecognitionEvent('error', (event) => {
+    if (userStoppedRef.current && (event.error === 'client' || event.error === 'aborted')) {
+      return;
+    }
+    if (event.error === 'client' && keepListeningRef.current) {
+      restartRecognizer();
+      return;
+    }
+    if (event.error === 'no-speech' && keepListeningRef.current) {
+      restartRecognizer();
+      return;
+    }
     setIsRecording(false);
+    keepListeningRef.current = false;
     setPartial('');
-    const msg = errorMessage(event);
-    setStatus('❌ ' + msg);
+    setStatus('❌ ' + errorMessage(event));
   });
 
   useSpeechRecognitionEvent('nomatch', () => {
+    if (keepListeningRef.current) return;
     setStatus('No speech detected — try again');
   });
 
@@ -127,10 +231,44 @@ function VoiceToText() {
     setAccepted((cur) => {
       const merged = cur.trim() ? cur.trim() + ' ' + piece : piece;
       acceptedRef.current = merged;
-      Clipboard.setStringAsync(merged).catch(() => {});
       return merged;
     });
-    showToast();
+  }
+
+  function buildStartOptions() {
+    const offline = onDeviceRef.current && supportsOnDevice;
+    return {
+      lang: languageRef.current,
+      interimResults: true,
+      continuous: true,
+      maxAlternatives: 1,
+      requiresOnDeviceRecognition: offline,
+      addsPunctuation: true,
+      androidRecognitionServicePackage: 'com.google.android.as',
+      androidIntentOptions: {
+        EXTRA_PREFER_OFFLINE: offline,
+      },
+    };
+  }
+
+  function restartRecognizer() {
+    if (restartCountRef.current >= 50) {
+      setIsRecording(false);
+      keepListeningRef.current = false;
+      setStatus('❌ Too many restarts — tap mic to try again');
+      return;
+    }
+    restartCountRef.current += 1;
+    setTimeout(() => {
+      if (!keepListeningRef.current) return;
+      try {
+        ExpoSpeechRecognitionModule.start(buildStartOptions());
+      } catch (e) {
+        setIsRecording(false);
+        keepListeningRef.current = false;
+        setStatus('❌ ' + (e?.message || String(e)));
+      }
+    }, 80);
   }
 
   async function start() {
@@ -144,28 +282,24 @@ function VoiceToText() {
         return;
       }
 
+      lastFinalRef.current = '';
       setPartial('');
       setStatus('Starting…');
+      userStoppedRef.current = false;
+      keepListeningRef.current = true;
+      restartCountRef.current = 0;
 
-      ExpoSpeechRecognitionModule.start({
-        lang: languageRef.current,
-        interimResults: true,
-        continuous: true,
-        maxAlternatives: 1,
-        requiresOnDeviceRecognition: onDeviceRef.current && supportsOnDevice,
-        addsPunctuation: true,
-        androidRecognitionServicePackage: 'com.google.android.as',
-        androidIntentOptions: {
-          EXTRA_PREFER_OFFLINE: onDeviceRef.current && supportsOnDevice,
-        },
-      });
+      ExpoSpeechRecognitionModule.start(buildStartOptions());
     } catch (e) {
       setIsRecording(false);
+      keepListeningRef.current = false;
       setStatus('❌ ' + (e?.message || String(e)));
     }
   }
 
   function stop() {
+    userStoppedRef.current = true;
+    keepListeningRef.current = false;
     try {
       ExpoSpeechRecognitionModule.stop();
     } catch {}
@@ -226,7 +360,10 @@ function VoiceToText() {
             <Text style={styles.badgeText}>{offlineActive ? 'Offline' : 'Online'}</Text>
           </View>
         </View>
-        <TouchableOpacity onPress={() => setShowInfo(true)} style={styles.gearBtn}>
+        <TouchableOpacity
+          onPress={() => { refreshInstalledLocales(); setShowInfo(true); }}
+          style={styles.gearBtn}
+        >
           <Text style={styles.gearText}>⚙</Text>
         </TouchableOpacity>
       </View>
@@ -235,27 +372,17 @@ function VoiceToText() {
         style={styles.content}
         behavior={Platform.OS === 'ios' ? 'padding' : undefined}
       >
-        <View style={styles.outputWrap}>
-          <TextInput
-            style={styles.output}
-            value={displayText()}
-            onChangeText={handleEdit}
-            placeholder="Tap the mic and start speaking — words appear as you talk."
-            placeholderTextColor={COLORS.muted}
-            multiline
-            textAlignVertical="top"
-            editable={!isRecording}
-            scrollEnabled
-          />
-          {isRecording && partial ? (
-            <View style={styles.partialPill}>
-              <View style={styles.pulseDot} />
-              <Text style={styles.partialPillText} numberOfLines={1}>
-                {partial}
-              </Text>
-            </View>
-          ) : null}
-        </View>
+        <TextInput
+          style={styles.output}
+          value={displayText()}
+          onChangeText={handleEdit}
+          placeholder="Tap the mic and start speaking — words appear as you talk."
+          placeholderTextColor={COLORS.muted}
+          multiline
+          textAlignVertical="top"
+          editable={!isRecording}
+          scrollEnabled
+        />
 
         <View style={styles.spacer} />
 
@@ -365,12 +492,23 @@ function VoiceToText() {
             <View style={styles.localeList}>
               {LANGS.map((l) => {
                 const installed = installedLocales.includes(l.value);
+                const isInstalling = installingLocale === l.value;
                 return (
                   <View key={l.value} style={styles.localeRow}>
                     <Text style={styles.localeName}>{l.value}</Text>
-                    <Text style={[styles.localeStatus, installed ? styles.localeOk : styles.localeMissing]}>
-                      {installed ? '✓ installed' : '— not installed'}
-                    </Text>
+                    {installed ? (
+                      <Text style={[styles.localeStatus, styles.localeOk]}>✓ installed</Text>
+                    ) : (
+                      <TouchableOpacity
+                        style={[styles.installBtn, isInstalling && styles.installBtnBusy]}
+                        onPress={() => installLocale(l.value)}
+                        disabled={!!installingLocale}
+                      >
+                        <Text style={styles.installBtnText}>
+                          {isInstalling ? 'Installing…' : '↓ Install'}
+                        </Text>
+                      </TouchableOpacity>
+                    )}
                   </View>
                 );
               })}
@@ -457,7 +595,6 @@ const styles = StyleSheet.create({
   },
   gearText: { color: COLORS.muted, fontSize: 18 },
   content: { flex: 1, padding: 16, gap: 12 },
-  outputWrap: { position: 'relative' },
   output: {
     minHeight: 200,
     maxHeight: 400,
@@ -470,28 +607,6 @@ const styles = StyleSheet.create({
     fontSize: 16,
     lineHeight: 24,
   },
-  partialPill: {
-    position: 'absolute',
-    left: 10,
-    bottom: 10,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-    paddingHorizontal: 10,
-    paddingVertical: 4,
-    borderRadius: 999,
-    backgroundColor: 'rgba(124,106,247,0.18)',
-    borderWidth: 1,
-    borderColor: COLORS.partial,
-    maxWidth: '90%',
-  },
-  pulseDot: {
-    width: 6,
-    height: 6,
-    borderRadius: 3,
-    backgroundColor: COLORS.recording,
-  },
-  partialPillText: { color: COLORS.partial, fontSize: 11, fontStyle: 'italic' },
   spacer: { flex: 1 },
   langRow: { flexDirection: 'row', gap: 6, flexWrap: 'wrap' },
   langChip: {
@@ -600,7 +715,14 @@ const styles = StyleSheet.create({
   localeName: { color: COLORS.text, fontSize: 13, fontFamily: Platform.select({ android: 'monospace' }) },
   localeStatus: { fontSize: 12 },
   localeOk: { color: COLORS.success },
-  localeMissing: { color: COLORS.muted },
+  installBtn: {
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 6,
+    backgroundColor: COLORS.accent,
+  },
+  installBtnBusy: { opacity: 0.5 },
+  installBtnText: { color: 'white', fontSize: 12, fontWeight: '600' },
   modalActions: {
     flexDirection: 'row',
     gap: 8,
